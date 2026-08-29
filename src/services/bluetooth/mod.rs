@@ -13,7 +13,13 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
 mod dbus;
 
-type EventStream = Pin<Box<dyn Stream<Item = ()> + Send>>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BluetoothEvent {
+    Bluez,
+    Rfkill,
+}
+
+type EventStream = Pin<Box<dyn Stream<Item = BluetoothEvent> + Send>>;
 
 #[derive(PartialEq, Eq, Debug, Clone)]
 pub enum BluetoothState {
@@ -64,16 +70,25 @@ pub enum BluetoothCommand {
 
 enum State {
     Init,
-    Active(zbus::Connection),
+    Active {
+        conn: zbus::Connection,
+        rfkill_soft_block: bool,
+    },
     Error,
 }
 
 impl BluetoothService {
-    async fn initialize_data(conn: &zbus::Connection) -> anyhow::Result<BluetoothData> {
+    async fn initialize_data(
+        conn: &zbus::Connection,
+        rfkill_soft_block: Option<bool>,
+    ) -> anyhow::Result<BluetoothData> {
         let bluetooth = BluetoothDbus::new(conn).await?;
 
         let state = bluetooth.state()?;
-        let rfkill_soft_block = BluetoothService::check_rfkill_soft_block().await?;
+        let rfkill_soft_block = match rfkill_soft_block {
+            Some(value) => value,
+            None => BluetoothService::check_rfkill_soft_block().await?,
+        };
 
         let state = match state {
             BluetoothState::Unavailable => BluetoothState::Unavailable,
@@ -113,13 +128,16 @@ impl BluetoothService {
         .then_some(())
     }
 
-    async fn events(conn: &zbus::Connection) -> anyhow::Result<impl Stream<Item = ()> + use<>> {
+    async fn events(
+        conn: &zbus::Connection,
+    ) -> anyhow::Result<impl Stream<Item = BluetoothEvent> + use<>> {
         let bluez = BluezObjectManagerProxy::new(conn).await?;
 
         let interface_changed = stream_select!(
             bluez.receive_interfaces_added().await?.map(|_| {}),
             bluez.receive_interfaces_removed().await?.map(|_| {}),
         )
+        .map(|_| BluetoothEvent::Bluez)
         .boxed();
 
         let properties_changed = zbus::MessageStream::for_match_rule(
@@ -136,7 +154,7 @@ impl BluetoothService {
         )
         .await?
         .filter_map(|message| async move { BluetoothService::relevant_property_changed(message) })
-        .map(|_| {})
+        .map(|_| BluetoothEvent::Bluez)
         .boxed();
 
         let rfkill = BluetoothService::listen_rfkill_soft_block_changes().await?;
@@ -152,7 +170,16 @@ impl BluetoothService {
         match state {
             State::Init => match zbus::Connection::system().await {
                 Ok(conn) => {
-                    let data = BluetoothService::initialize_data(&conn).await;
+                    let rfkill_soft_block = match BluetoothService::check_rfkill_soft_block().await
+                    {
+                        Ok(value) => value,
+                        Err(err) => {
+                            error!("Failed to initialize bluetooth service: {err}");
+                            return State::Error;
+                        }
+                    };
+                    let data =
+                        BluetoothService::initialize_data(&conn, Some(rfkill_soft_block)).await;
 
                     match data {
                         Ok(data) => {
@@ -165,7 +192,10 @@ impl BluetoothService {
                                 }))
                                 .await;
 
-                            State::Active(conn)
+                            State::Active {
+                                conn,
+                                rfkill_soft_block,
+                            }
                         }
                         Err(err) => {
                             error!("Failed to initialize bluetooth service: {err}");
@@ -180,18 +210,37 @@ impl BluetoothService {
                     State::Error
                 }
             },
-            State::Active(conn) => {
+            State::Active {
+                conn,
+                mut rfkill_soft_block,
+            } => {
                 info!("Listening for bluetooth events");
 
                 match BluetoothService::events(&conn).await {
                     Ok(mut events) => {
-                        while events.next().await.is_some() {
-                            if let Ok(data) = BluetoothService::initialize_data(&conn).await {
+                        while let Some(event) = events.next().await {
+                            if event == BluetoothEvent::Rfkill {
+                                match BluetoothService::check_rfkill_soft_block().await {
+                                    Ok(value) => rfkill_soft_block = value,
+                                    Err(err) => {
+                                        warn!("Failed to refresh bluetooth rfkill state: {err}");
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            if let Ok(data) =
+                                BluetoothService::initialize_data(&conn, Some(rfkill_soft_block))
+                                    .await
+                            {
                                 let _ = output.send(ServiceEvent::Update(data)).await;
                             }
                         }
 
-                        State::Active(conn)
+                        State::Active {
+                            conn,
+                            rfkill_soft_block,
+                        }
                     }
                     Err(err) => {
                         error!("Failed to listen for bluetooth events: {err}");
@@ -235,13 +284,16 @@ impl BluetoothService {
         Ok(output.contains("Soft blocked: yes"))
     }
 
-    pub async fn listen_rfkill_soft_block_changes() -> anyhow::Result<EventStream> {
+    async fn listen_rfkill_soft_block_changes() -> anyhow::Result<EventStream> {
         let inotify = Inotify::init()?;
 
         match inotify.watches().add("/dev/rfkill", WatchMask::MODIFY) {
             Ok(_) => {
                 let buffer = [0; 512];
-                Ok(inotify.into_event_stream(buffer)?.map(|_| {}).boxed())
+                Ok(inotify
+                    .into_event_stream(buffer)?
+                    .map(|_| BluetoothEvent::Rfkill)
+                    .boxed())
             }
             Err(err) if err.kind() == ErrorKind::NotFound => {
                 warn!("/dev/rfkill not found, disabling rfkill change notifications for bluetooth");
@@ -326,7 +378,7 @@ impl Service for BluetoothService {
                             tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
                             let _ = bluetooth.stop_discovery().await;
                         }
-                        BluetoothService::initialize_data(&conn)
+                        BluetoothService::initialize_data(&conn, None)
                             .await
                             .unwrap_or_else(|_| BluetoothData {
                                 state: BluetoothState::Unavailable,
@@ -346,7 +398,7 @@ impl Service for BluetoothService {
                             debug!("Pairing device: {:?}", device_path);
                             let _ = bluetooth.pair_device(&device_path).await;
                         }
-                        BluetoothService::initialize_data(&conn)
+                        BluetoothService::initialize_data(&conn, None)
                             .await
                             .unwrap_or_else(|_| BluetoothData {
                                 state: BluetoothState::Unavailable,
@@ -366,7 +418,7 @@ impl Service for BluetoothService {
                             debug!("Connecting device: {:?}", device_path);
                             let _ = bluetooth.connect_device(&device_path).await;
                         }
-                        BluetoothService::initialize_data(&conn)
+                        BluetoothService::initialize_data(&conn, None)
                             .await
                             .unwrap_or_else(|_| BluetoothData {
                                 state: BluetoothState::Unavailable,
@@ -386,7 +438,7 @@ impl Service for BluetoothService {
                             debug!("Disconnecting device: {:?}", device_path);
                             let _ = bluetooth.disconnect_device(&device_path).await;
                         }
-                        BluetoothService::initialize_data(&conn)
+                        BluetoothService::initialize_data(&conn, None)
                             .await
                             .unwrap_or_else(|_| BluetoothData {
                                 state: BluetoothState::Unavailable,
@@ -406,7 +458,7 @@ impl Service for BluetoothService {
                             debug!("Removing device: {:?}", device_path);
                             let _ = bluetooth.remove_device(&device_path).await;
                         }
-                        BluetoothService::initialize_data(&conn)
+                        BluetoothService::initialize_data(&conn, None)
                             .await
                             .unwrap_or_else(|_| BluetoothData {
                                 state: BluetoothState::Unavailable,

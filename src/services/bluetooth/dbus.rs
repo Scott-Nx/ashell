@@ -7,36 +7,59 @@ use zbus::{
 
 use super::{BluetoothDevice, BluetoothState};
 
-type ManagedObjects = HashMap<OwnedObjectPath, HashMap<String, HashMap<String, OwnedValue>>>;
+type InterfaceProperties = HashMap<String, OwnedValue>;
+type ManagedObjects = HashMap<OwnedObjectPath, HashMap<String, InterfaceProperties>>;
+
+const ADAPTER_INTERFACE: &str = "org.bluez.Adapter1";
+const DEVICE_INTERFACE: &str = "org.bluez.Device1";
+const BATTERY_INTERFACE: &str = "org.bluez.Battery1";
 
 pub struct BluetoothDbus<'a> {
     pub bluez: BluezObjectManagerProxy<'a>,
     pub adapter: Option<AdapterProxy<'a>>,
+    adapter_path: Option<OwnedObjectPath>,
+    managed_objects: ManagedObjects,
 }
 
 impl BluetoothDbus<'_> {
     pub async fn new(conn: &zbus::Connection) -> anyhow::Result<Self> {
         let bluez = BluezObjectManagerProxy::new(conn).await?;
-        let adapter = bluez
-            .get_managed_objects()
-            .await?
-            .into_iter()
-            .filter_map(|(key, item)| {
-                if item.contains_key("org.bluez.Adapter1") {
-                    Some(key)
-                } else {
-                    None
-                }
-            })
-            .next();
+        let managed_objects = bluez.get_managed_objects().await?;
+        let adapter_path = managed_objects
+            .iter()
+            .find_map(|(key, item)| item.contains_key(ADAPTER_INTERFACE).then(|| key.clone()));
 
-        let adapter = if let Some(adapter) = adapter {
+        let adapter = if let Some(adapter) = adapter_path.clone() {
             Some(AdapterProxy::builder(conn).path(adapter)?.build().await?)
         } else {
             None
         };
 
-        Ok(Self { bluez, adapter })
+        Ok(Self {
+            bluez,
+            adapter,
+            adapter_path,
+            managed_objects,
+        })
+    }
+
+    fn property<T>(properties: &InterfaceProperties, name: &str) -> Option<T>
+    where
+        T: TryFrom<OwnedValue>,
+    {
+        properties.get(name)?.try_clone().ok()?.try_into().ok()
+    }
+
+    fn adapter_properties(&self) -> Option<&InterfaceProperties> {
+        self.adapter_path
+            .as_ref()
+            .and_then(|path| self.managed_objects.get(path))
+            .and_then(|interfaces| interfaces.get(ADAPTER_INTERFACE))
+    }
+
+    pub fn powered(&self) -> Option<bool> {
+        self.adapter_properties()
+            .and_then(|properties| Self::property(properties, "Powered"))
     }
 
     pub async fn set_powered(&self, value: bool) -> zbus::Result<()> {
@@ -47,17 +70,20 @@ impl BluetoothDbus<'_> {
         Ok(())
     }
 
-    pub async fn state(&self) -> zbus::Result<BluetoothState> {
-        match &self.adapter {
-            Some(adapter) => {
-                if adapter.powered().await? {
-                    Ok(BluetoothState::Active)
-                } else {
-                    Ok(BluetoothState::Inactive)
-                }
-            }
-            _ => Ok(BluetoothState::Unavailable),
+    pub fn state(&self) -> anyhow::Result<BluetoothState> {
+        if self.adapter_path.is_none() {
+            return Ok(BluetoothState::Unavailable);
         }
+
+        let powered = self
+            .powered()
+            .ok_or_else(|| anyhow::anyhow!("missing or invalid Adapter1.Powered property"))?;
+
+        Ok(if powered {
+            BluetoothState::Active
+        } else {
+            BluetoothState::Inactive
+        })
     }
 
     pub async fn start_discovery(&self) -> zbus::Result<()> {
@@ -74,46 +100,41 @@ impl BluetoothDbus<'_> {
         Ok(())
     }
 
-    pub async fn discovering(&self) -> zbus::Result<bool> {
-        match &self.adapter {
-            Some(adapter) => adapter.discovering().await,
-            _ => Ok(false),
-        }
+    pub fn discovering(&self) -> bool {
+        self.adapter_properties()
+            .and_then(|properties| Self::property(properties, "Discovering"))
+            .unwrap_or(false)
     }
 
-    pub async fn devices(&self) -> anyhow::Result<Vec<BluetoothDevice>> {
-        let devices_proxy = self
-            .bluez
-            .get_managed_objects()
-            .await?
-            .into_iter()
-            .filter_map(|(key, item)| {
-                if item.contains_key("org.bluez.Device1") {
-                    Some((key.clone(), item.contains_key("org.bluez.Battery1")))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-
+    pub fn devices(&self) -> anyhow::Result<Vec<BluetoothDevice>> {
         let mut devices = Vec::new();
-        for (device_path, has_battery) in devices_proxy {
-            let device = DeviceProxy::builder(self.bluez.inner().connection())
-                .path(device_path.clone())?
-                .build()
-                .await?;
 
-            let name = device.alias().await?;
-            let connected = device.connected().await?;
-            let paired = device.paired().await?;
+        for (device_path, interfaces) in &self.managed_objects {
+            let Some(device_properties) = interfaces.get(DEVICE_INTERFACE) else {
+                continue;
+            };
 
-            let battery = if connected && has_battery {
-                let battery_proxy = BatteryProxy::builder(self.bluez.inner().connection())
-                    .path(&device_path)?
-                    .build()
-                    .await?;
+            let name = Self::property(device_properties, "Alias").ok_or_else(|| {
+                anyhow::anyhow!("missing or invalid Device1.Alias property for {device_path:?}")
+            })?;
+            let connected = Self::property(device_properties, "Connected").ok_or_else(|| {
+                anyhow::anyhow!("missing or invalid Device1.Connected property for {device_path:?}")
+            })?;
+            let paired = Self::property(device_properties, "Paired").ok_or_else(|| {
+                anyhow::anyhow!("missing or invalid Device1.Paired property for {device_path:?}")
+            })?;
 
-                Some(battery_proxy.percentage().await?)
+            let battery = if connected {
+                interfaces
+                    .get(BATTERY_INTERFACE)
+                    .map(|properties| {
+                        Self::property(properties, "Percentage").ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "missing or invalid Battery1.Percentage property for {device_path:?}"
+                            )
+                        })
+                    })
+                    .transpose()?
             } else {
                 None
             };
@@ -121,7 +142,7 @@ impl BluetoothDbus<'_> {
             devices.push(BluetoothDevice {
                 name,
                 battery,
-                path: device_path,
+                path: device_path.clone(),
                 connected,
                 paired,
             });
@@ -187,41 +208,20 @@ pub trait BluezObjectManager {
 )]
 pub trait Adapter {
     #[zbus(property)]
-    fn powered(&self) -> zbus::Result<bool>;
-
-    #[zbus(property)]
     fn set_powered(&self, value: bool) -> zbus::Result<()>;
 
     fn start_discovery(&self) -> zbus::Result<()>;
 
     fn stop_discovery(&self) -> zbus::Result<()>;
 
-    #[zbus(property)]
-    fn discovering(&self) -> zbus::Result<bool>;
-
     fn remove_device(&self, device: zbus::zvariant::ObjectPath<'_>) -> zbus::Result<()>;
 }
 
 #[proxy(default_service = "org.bluez", interface = "org.bluez.Device1")]
-pub trait Device {
-    #[zbus(property)]
-    fn alias(&self) -> zbus::Result<String>;
-
-    #[zbus(property)]
-    fn connected(&self) -> zbus::Result<bool>;
-
-    #[zbus(property)]
-    fn paired(&self) -> zbus::Result<bool>;
-
+trait Device {
     fn pair(&self) -> zbus::Result<()>;
 
     fn connect(&self) -> zbus::Result<()>;
 
     fn disconnect(&self) -> zbus::Result<()>;
-}
-
-#[proxy(default_service = "org.bluez", interface = "org.bluez.Battery1")]
-pub trait Battery {
-    #[zbus(property)]
-    fn percentage(&self) -> zbus::Result<u8>;
 }

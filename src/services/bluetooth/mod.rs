@@ -1,5 +1,5 @@
 use super::{ReadOnlyService, Service, ServiceEvent};
-use dbus::{BatteryProxy, BluetoothDbus, DeviceProxy};
+use dbus::{BluetoothDbus, BluezObjectManagerProxy};
 use iced::{
     Subscription, Task,
     futures::{SinkExt, Stream, StreamExt, channel::mpsc::Sender, stream::pending, stream_select},
@@ -7,9 +7,9 @@ use iced::{
 };
 use inotify::{Inotify, WatchMask};
 use log::{debug, error, info, warn};
-use std::{any::TypeId, io::ErrorKind, ops::Deref, pin::Pin};
+use std::{any::TypeId, collections::HashMap, io::ErrorKind, ops::Deref, pin::Pin};
 use tokio::process::Command;
-use zbus::zvariant::OwnedObjectPath;
+use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
 mod dbus;
 
@@ -72,7 +72,7 @@ impl BluetoothService {
     async fn initialize_data(conn: &zbus::Connection) -> anyhow::Result<BluetoothData> {
         let bluetooth = BluetoothDbus::new(conn).await?;
 
-        let state = bluetooth.state().await?;
+        let state = bluetooth.state()?;
         let rfkill_soft_block = BluetoothService::check_rfkill_soft_block().await?;
 
         let state = match state {
@@ -80,8 +80,8 @@ impl BluetoothService {
             BluetoothState::Active if rfkill_soft_block => BluetoothState::Inactive,
             state => state,
         };
-        let devices = bluetooth.devices().await?;
-        let discovering = bluetooth.discovering().await.unwrap_or(false);
+        let devices = bluetooth.devices()?;
+        let discovering = bluetooth.discovering();
 
         Ok(BluetoothData {
             state,
@@ -90,84 +90,62 @@ impl BluetoothService {
         })
     }
 
+    fn relevant_property_changed(message: zbus::Result<zbus::Message>) -> Option<()> {
+        let message = message.ok()?;
+        let (interface, changed, invalidated): (String, HashMap<String, OwnedValue>, Vec<String>) =
+            message.body().deserialize().ok()?;
+
+        let has_changed = |properties: &[&str]| {
+            properties.iter().any(|property| {
+                changed.contains_key(*property)
+                    || invalidated
+                        .iter()
+                        .any(|invalidated| invalidated == property)
+            })
+        };
+
+        match interface.as_str() {
+            "org.bluez.Adapter1" => has_changed(&["Powered", "Discovering"]),
+            "org.bluez.Device1" => has_changed(&["Connected"]),
+            "org.bluez.Battery1" => has_changed(&["Percentage"]),
+            _ => false,
+        }
+        .then_some(())
+    }
+
     async fn events(conn: &zbus::Connection) -> anyhow::Result<impl Stream<Item = ()> + use<>> {
-        let bluetooth = BluetoothDbus::new(conn).await?;
+        let bluez = BluezObjectManagerProxy::new(conn).await?;
 
         let interface_changed = stream_select!(
-            bluetooth
-                .bluez
-                .receive_interfaces_added()
-                .await?
-                .map(|_| {}),
-            bluetooth
-                .bluez
-                .receive_interfaces_removed()
-                .await?
-                .map(|_| {}),
+            bluez.receive_interfaces_added().await?.map(|_| {}),
+            bluez.receive_interfaces_removed().await?.map(|_| {}),
         )
         .boxed();
 
-        let combined = match bluetooth.adapter.as_ref() {
-            Some(adapter) => {
-                let powered = adapter.receive_powered_changed().await.map(|_| {});
-                let discovering = adapter.receive_discovering_changed().await.map(|_| {});
-                let rfkill = BluetoothService::listen_rfkill_soft_block_changes().await?;
-                let devices = bluetooth.devices().await?;
+        let properties_changed = zbus::MessageStream::for_match_rule(
+            zbus::MatchRule::builder()
+                .msg_type(zbus::message::Type::Signal)
+                .sender("org.bluez")?
+                .interface("org.freedesktop.DBus.Properties")?
+                .member("PropertiesChanged")?
+                .arg0ns("org.bluez")?
+                .path_namespace("/org/bluez")?
+                .build(),
+            conn,
+            None,
+        )
+        .await?
+        .filter_map(|message| async move { BluetoothService::relevant_property_changed(message) })
+        .map(|_| {})
+        .boxed();
 
-                let mut batteries: Vec<EventStream> = Vec::with_capacity(devices.len());
-                let mut device_properties: Vec<EventStream> = Vec::with_capacity(devices.len());
-                for device in devices {
-                    let conn = bluetooth.bluez.inner().connection();
+        let rfkill = BluetoothService::listen_rfkill_soft_block_changes().await?;
 
-                    let battery = BatteryProxy::builder(conn)
-                        .path(device.path.clone())?
-                        .build()
-                        .await?;
-                    batteries.push(
-                        battery
-                            .receive_percentage_changed()
-                            .await
-                            .map(|_| {})
-                            .boxed(),
-                    );
-
-                    let device_proxy = DeviceProxy::builder(conn)
-                        .path(device.path)?
-                        .build()
-                        .await?;
-                    let connected_changed: EventStream = device_proxy
-                        .receive_connected_changed()
-                        .await
-                        .map(|_| {})
-                        .boxed();
-                    device_properties.push(connected_changed);
-                }
-
-                let battery_events = if batteries.is_empty() {
-                    iced::futures::stream::pending().boxed()
-                } else {
-                    iced::futures::stream::select_all(batteries).boxed()
-                };
-
-                let device_property_events = if device_properties.is_empty() {
-                    iced::futures::stream::pending().boxed()
-                } else {
-                    iced::futures::stream::select_all(device_properties).boxed()
-                };
-
-                Box::pin(stream_select!(
-                    interface_changed,
-                    powered,
-                    discovering,
-                    rfkill,
-                    battery_events,
-                    device_property_events,
-                ))
-            }
-            _ => interface_changed,
-        };
-
-        Ok(combined)
+        Ok(Box::pin(stream_select!(
+            interface_changed,
+            properties_changed,
+            rfkill,
+        )))
     }
 
     async fn start_listening(state: State, output: &mut Sender<ServiceEvent<Self>>) -> State {
